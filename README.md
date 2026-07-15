@@ -140,7 +140,7 @@ Local Ollama-powered AI agent for read-only Commutr API queries. Zero cloud cost
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/dluntaox/commutr-AI.git
+git clone https://github.com/darelleluntao/commutr-AI.git
 cd commutr-AI
 
 # Create virtual environment
