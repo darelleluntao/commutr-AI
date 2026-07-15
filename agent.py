@@ -17,7 +17,7 @@ import ollama
 
 import tools as api
 
-DEFAULT_MODEL = "qwen2.5:7b"
+DEFAULT_MODEL = "qwen2.5:14b"
 
 # Tool results larger than this get compacted before they reach the model —
 # a 7B local model has a small context window and list endpoints can return
