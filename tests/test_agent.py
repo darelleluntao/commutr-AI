@@ -108,6 +108,57 @@ class TestToolRouting:
         assert result["status_code"] == 403
 
 
+class TestAdaptivePrompt:
+    def test_prompt_contains_current_date(self):
+        import agent
+        from datetime import datetime
+
+        with patch("agent._live_context", return_value=""):
+            prompt = agent.build_system_prompt()
+        assert datetime.now().strftime("%Y-%m-%d") in prompt
+
+    def test_prompt_contains_live_routes(self):
+        import agent
+
+        with patch(
+            "tools.get_routes",
+            return_value={"data": [{"id": 5, "origin": "Cubao", "destination": "Baguio"}]},
+        ):
+            prompt = agent.build_system_prompt()
+        assert "Route 5: Cubao → Baguio" in prompt
+
+    def test_prompt_survives_api_down(self):
+        import agent
+
+        with patch("tools.get_routes", side_effect=Exception("connection refused")):
+            prompt = agent.build_system_prompt()
+        assert "snapshot unavailable" in prompt
+
+
+class TestCompactResult:
+    def test_small_result_untouched(self):
+        import agent
+
+        result = {"data": [{"id": 1}]}
+        assert json.loads(agent._compact_result(result)) == result
+
+    def test_large_list_truncated_with_note(self):
+        import agent
+
+        result = {"data": [{"id": i} for i in range(500)]}
+        compacted = json.loads(agent._compact_result(result))
+        assert len(compacted["data"]) == agent.MAX_TOOL_ITEMS
+        assert "500" in compacted["_note"]
+
+    def test_char_cap_enforced(self):
+        import agent
+
+        result = {"data": [{"blob": "x" * 1000, "id": i} for i in range(30)]}
+        text = agent._compact_result(result)
+        assert len(text) <= agent.MAX_TOOL_CHARS + 100
+        assert "truncated" in text
+
+
 class TestToolsParams:
     @patch("tools.requests.get")
     def test_get_schedules_passes_query_params(self, mock_get):
