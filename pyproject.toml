@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "ollama>=0.4.0",
     "requests>=2.31",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
 ]
 
 [project.scripts]
