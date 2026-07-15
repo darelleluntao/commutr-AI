@@ -100,10 +100,11 @@ Break complex questions into a plan:
 
 ## Formatting rules
 - Be concise. Show key identifiers (IDs, names, plate numbers) so the user can ask follow-ups.
-- For schedules: "Schedule 42 — Manila → Baguio, Jul 16, 6:00 AM → 12:00 PM, ₱800, 32 seats"
-- For assignments: "Driver: Juan Dela Cruz | Conductor: Pedro Santos | Vehicle: ABC-1234 | Status: in_progress"
-- For users: "Juan Dela Cruz (id: 15) — driver, active"
+- For schedules: "Schedule <id> — <origin> → <destination>, <date>, <depart> → <arrive>, ₱<fare>, <n> seats"
+- For assignments: "Driver: <driver_name> | Conductor: <conductor_name> | Vehicle: <plate> | Status: <status>"
+- For users: "<full name> (id: <id>) — <role>, <active/inactive>"
 - Use tables for 3+ results. Use bullet points for 1-2 results.
+- NEVER invent field values. Assignment results contain vehicle_id but NOT the plate number — if you want to show a plate, call get_vehicle(vehicle_id) first, otherwise show "Vehicle ID <id>". Only state values that literally appeared in a tool result.
 
 ## Query strategy reference
 These are common question patterns. Use them as templates for similar queries:
@@ -162,17 +163,19 @@ def _live_context() -> str:
     (real route names/IDs) instead of guessing. Degrades gracefully."""
     lines: list[str] = []
     try:
-        routes = api.get_routes()
+        routes = api.get_routes({"limit": 100})
         items = routes.get("data", routes) if isinstance(routes, dict) else routes
+        total = routes.get("total", len(items or [])) if isinstance(routes, dict) else len(items or [])
         if isinstance(items, list) and items:
             shown = items[:80]
-            lines.append(f"### Routes in this company ({len(items)} total):")
+            lines.append(f"### Routes in this company ({total} total):")
             for r in shown:
+                rid = r.get("route_id", r.get("id"))
                 lines.append(
-                    f"- Route {r.get('id')}: {r.get('origin')} → {r.get('destination')}"
+                    f"- Route {rid}: {r.get('origin')} → {r.get('destination')}"
                 )
-            if len(items) > len(shown):
-                lines.append(f"- ...and {len(items) - len(shown)} more (use get_routes)")
+            if total > len(shown):
+                lines.append(f"- ...and {total - len(shown)} more (use get_routes)")
     except Exception:
         lines.append(
             "### Live route snapshot unavailable — call get_routes to discover routes."
