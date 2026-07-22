@@ -7,3 +7,5 @@ token.json
 dist/
 build/
 .env.local
+.server.pid
+server.log

@@ -130,6 +130,9 @@ class TestAdaptivePrompt:
     def test_prompt_survives_api_down(self):
         import agent
 
+        # Clear the live-context cache so this test actually hits the API.
+        agent._live_cache[0] = None
+        agent._live_cache[1] = 0.0
         with patch("tools.get_routes", side_effect=Exception("connection refused")):
             prompt = agent.build_system_prompt()
         assert "snapshot unavailable" in prompt

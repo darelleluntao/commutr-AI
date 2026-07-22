@@ -12,8 +12,10 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any
+
+PHT = timezone(timedelta(hours=8))
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -37,7 +39,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_STARTED_AT = datetime.now().astimezone()
+_STARTED_AT = datetime.now(PHT)
 _CONVERSATIONS: dict[str, list[dict[str, Any]]] = {}
 
 
@@ -61,7 +63,7 @@ def health():
         "ollama": ollama_status,
         "api": api_status,
         "started_at": _STARTED_AT.isoformat(),
-        "uptime_seconds": (datetime.now().astimezone() - _STARTED_AT).total_seconds(),
+        "uptime_seconds": (datetime.now(PHT) - _STARTED_AT).total_seconds(),
     }
 
 

@@ -10,17 +10,20 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone, timedelta
 from typing import Any
+
+PHT = timezone(timedelta(hours=8))
 
 import ollama
 
 import tools as api
 
-DEFAULT_MODEL = "qwen2.5:14b"
+DEFAULT_MODEL = "qwen2.5:7b"
 
 # Tool results larger than this get compacted before they reach the model —
-# a 7B local model has a small context window and list endpoints can return
+# a 7B local model has a smaller context window and list endpoints can return
 # tens of thousands of rows.
 MAX_TOOL_ITEMS = 40
 MAX_TOOL_CHARS = 12000
@@ -34,13 +37,25 @@ def _ollama_options() -> dict[str, Any]:
     # Ollama defaults num_ctx to 4096, which the system prompt + tool
     # definitions alone exceed — the prompt gets silently truncated and the
     # model loses its instructions. qwen2.5 supports 32k.
-    return {"num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "16384"))}
+    # Low temperature + repeat_penalty keep this read-only agent factual and
+    # stop qwen2.5 from looping tool calls or rambling on answers.
+    return {
+        "num_ctx": int(os.getenv("OLLAMA_NUM_CTX", "16384")),
+        "temperature": float(os.getenv("OLLAMA_TEMPERATURE", "0.1")),
+        "repeat_penalty": float(os.getenv("OLLAMA_REPEAT_PENALTY", "1.1")),
+        # Keep the model resident between requests so we never pay the full
+        # load cost on the next call. -1 = never unload.
+        "keep_alive": int(os.getenv("OLLAMA_KEEP_ALIVE", "-1")),
+    }
 
 
 SYSTEM_PROMPT = """You are a read-only AI agent for Commutr, a Philippine bus booking and operations platform.
 
 ## Your job
 Answer questions about schedules, routes, trips, drivers, conductors, vehicles, bookings, and boarding manifests. You can call tools to look up data. Never fabricate anything — if a tool returns nothing, say so.
+
+## Language
+Always respond in English, regardless of the language of any names, data, or content returned by tools. Do not translate your answers into Thai or any other language.
 
 ## Core concepts
 - A **Schedule** represents a bus trip on a specific route, date, and departure time. Status: scheduled/active/ongoing/delayed/completed/cancelled.
@@ -155,12 +170,32 @@ These are common question patterns. Use them as templates for similar queries:
   get_trip_tracking(assignment_id) — only meaningful while status=in_progress
 
 "what happened on trip / assignment X" →
-  get_trip_events(assignment_id=X) for arrivals, delays, and reported issues"""
+  get_trip_events(assignment_id=X) for arrivals, delays, and reported issues
+
+## Worked example
+User: "Show me today's Manila to Baguio trips and how full they are."
+Assistant:
+  get_routes() -> find route_id 1 (Manila → Baguio)
+  get_schedules(route_id=1, date=<today from date line above>)
+  for each returned schedule_id: get_schedule_bookings(schedule_id) and count
+  then report each trip as: "Schedule <id> — Manila → Baguio, <date>, <depart>, ₱<fare>, <booked>/<capacity> seats (<pct>% full)"
+Note: call tools first, gather data, THEN write the answer in one concise block. Do not ask the user for IDs you can look up yourself.
+
+## Handling large datasets
+- For COUNTS / TOTALS / SUMMARIES (e.g. "how many bookings today", "total revenue"), use the report endpoints (get_reports_bookings, get_reports_revenue, get_reports_trips) — never fetch and count rows yourself.
+- For LISTS, always pass the tightest filters you can (date, date_from/date_to, route_id, schedule_id, status) and a 'limit' (e.g. 100). Results are paginated: check the 'total' field and advance 'offset' to page through more. Never assume one page is the whole dataset.
+- Do NOT enumerate every route/entity to answer a simple question. If the user asks about bookings, use booking tools directly (get_admin_bookings with filters, or get_schedule_bookings for one schedule) — do not iterate over all routes or fetch route stops.
+- If a result is truncated ("showing N of M"), refine with filters; do not report it as the complete answer."""
 
 
 def _live_context() -> str:
     """Fetch a small snapshot of live data so the model knows what exists
-    (real route names/IDs) instead of guessing. Degrades gracefully."""
+    (real route names/IDs) instead of guessing. Degrades gracefully.
+    Cached per-process for LIVE_CONTEXT_TTL seconds so we don't pay a network
+    round-trip on every single query."""
+    now_ts = time.monotonic()
+    if _live_cache[0] is not None and (now_ts - _live_cache[1]) < LIVE_CONTEXT_TTL:
+        return _live_cache[0]
     lines: list[str] = []
     try:
         routes = api.get_routes({"limit": 100})
@@ -180,11 +215,19 @@ def _live_context() -> str:
         lines.append(
             "### Live route snapshot unavailable — call get_routes to discover routes."
         )
-    return "\n".join(lines)
+    snapshot = "\n".join(lines)
+    _live_cache[0] = snapshot
+    _live_cache[1] = now_ts
+    return snapshot
+
+
+# (text, timestamp) tuple cache + TTL for the live route snapshot.
+_live_cache: list[Any] = [None, 0.0]
+LIVE_CONTEXT_TTL = float(os.getenv("COMMUTR_LIVE_CONTEXT_TTL", "300"))
 
 
 def build_system_prompt() -> str:
-    now = datetime.now().astimezone()
+    now = datetime.now(PHT)
     header = (
         f"Current date/time: {now.strftime('%A, %B %d, %Y %I:%M %p %Z')} "
         f"(ISO: {now.strftime('%Y-%m-%d')}). "
@@ -237,11 +280,18 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_schedule_bookings",
-            "description": "List all bookings on a schedule.",
+            "description": (
+                "List bookings on a single schedule. Results are paginated — set "
+                "'limit' (e.g. 100) and advance 'offset' to page through more. "
+                "Check the 'total' field; do NOT assume one page is complete."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "schedule_id": {"type": "integer"},
+                    "status": {"type": "string"},
+                    "limit": {"type": "integer", "description": "page size (default 40, max ~100)"},
+                    "offset": {"type": "integer", "description": "page offset for pagination"},
                 },
                 "required": ["schedule_id"],
             },
@@ -373,12 +423,24 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "get_admin_bookings",
-            "description": "List all bookings (admin view). Use params: status, schedule_id.",
+            "description": (
+                "List bookings (admin view). Results are paginated — pass the "
+                "tightest filters you can: date (YYYY-MM-DD), date_from/date_to, "
+                "route_id, schedule_id, status. Always set a 'limit' (e.g. 100) "
+                "and advance 'offset' to page through more. Check the 'total' "
+                "field; do NOT assume one page is the whole dataset."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "status": {"type": "string"},
                     "schedule_id": {"type": "integer"},
+                    "route_id": {"type": "integer"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD"},
+                    "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                    "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                    "limit": {"type": "integer", "description": "page size (default 40, max ~100)"},
+                    "offset": {"type": "integer", "description": "page offset for pagination"},
                 },
             },
         },
@@ -521,6 +583,13 @@ TOOL_DEFINITIONS = [
     },
 ]
 
+# Required params per tool, derived once from the tool definitions so the
+# dispatch layer can validate a model-produced call before hitting the API.
+REQUIRED_PARAMS: dict[str, list[str]] = {
+    fn["function"]["name"]: fn["function"].get("parameters", {}).get("required", [])
+    for fn in TOOL_DEFINITIONS
+}
+
 TOOL_DISPATCH = {
     "get_schedules": lambda args: api.get_schedules(args),
     "get_schedule": lambda args: api.get_schedule(args["schedule_id"]),
@@ -559,10 +628,20 @@ def _call_tool(name: str, arguments: dict[str, Any]) -> Any:
     handler = TOOL_DISPATCH.get(name)
     if handler is None:
         return {"error": f"Unknown tool: {name}"}
+    missing = [p for p in REQUIRED_PARAMS.get(name, []) if arguments.get(p) in (None, "")]
+    if missing:
+        return {
+            "error": (
+                f"Missing required argument(s) for {name}: {', '.join(missing)}. "
+                f"Re-call {name} with those arguments filled in."
+            )
+        }
     try:
         return handler(arguments)
     except api.ApiError as e:
         return {"error": str(e), "status_code": e.status_code, "body": e.body}
+    except (KeyError, TypeError) as e:
+        return {"error": f"Invalid arguments for {name}: {e}. Re-call with correct arguments."}
 
 
 def _compact_result(result: Any) -> str:
@@ -585,13 +664,27 @@ def _compact_result(result: Any) -> str:
     return text
 
 
+def _prune_history(messages: list[dict[str, Any]], keep_last: int = 2) -> None:
+    """Shrink older tool-result messages so a long multi-turn chain can't blow
+    out the context window. The most recent `keep_last` tool results stay full;
+    older ones are aggressively truncated to a one-line note."""
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    for idx in tool_indices[:-keep_last]:
+        old = messages[idx]["content"]
+        if len(old) > 200:
+            messages[idx]["content"] = (
+                "[earlier tool result omitted — summary: "
+                f"{old[:120].replace(chr(10), ' ')}…]"
+            )
+
+
 def _run_conversation(question: str, system_prompt: str | None = None) -> str:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt or build_system_prompt()},
         {"role": "user", "content": question},
     ]
 
-    max_turns = 8
+    max_turns = 6
     for _turn in range(max_turns):
         response = ollama.chat(
             model=_model(),
@@ -626,6 +719,9 @@ def _run_conversation(question: str, system_prompt: str | None = None) -> str:
                 "content": content,
             })
 
+        # Keep context bounded by summarizing tool results from earlier turns.
+        _prune_history(messages)
+
     # Out of tool budget — ask for a final answer from what was gathered.
     messages.append({
         "role": "user",
@@ -645,9 +741,8 @@ def _interactive() -> None:
     print(f"API: {os.getenv('COMMUTR_API_BASE', 'http://localhost:8080')}")
     print('Type your question or "exit".\n')
 
-    # Build once per session: fetches the live route snapshot a single time.
-    system_prompt = build_system_prompt()
-
+    # Build per question so the "current date/time" line stays fresh across a
+    # long session (build_system_prompt reads the clock on every call).
     try:
         while True:
             q = input("> ").strip()
@@ -656,7 +751,7 @@ def _interactive() -> None:
             if not q:
                 continue
             print()
-            answer = _run_conversation(q, system_prompt)
+            answer = _run_conversation(q)
             print(answer)
             print()
     except KeyboardInterrupt:
