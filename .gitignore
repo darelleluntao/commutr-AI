@@ -9,3 +9,4 @@ build/
 .env.local
 .server.pid
 server.log
+graphify-out/
